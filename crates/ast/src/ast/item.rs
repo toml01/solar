@@ -732,6 +732,12 @@ impl Visibility {
 #[derive(Debug)]
 pub struct VariableDefinition<'ast> {
     pub span: Span,
+    /// fhec fork patch (`.fsol` dialect extension, fhec spec §2.3): the span of the
+    /// `in` keyword when this variable was declared with the encrypted-input parameter
+    /// sugar, e.g. `in euint32 amount`. Always `None` for plain Solidity sources.
+    /// Whether the sugar is *legal* in this position is decided by the fhec checker, not
+    /// the parser.
+    pub in_sugar: Option<Span>,
     pub ty: Type<'ast>,
     pub visibility: Option<Visibility>,
     pub mutability: Option<VarMut>,

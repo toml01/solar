@@ -206,7 +206,8 @@ mod tests {
         assert_size::<UsingDirective<'_>>(str!["48"]);
         assert_size::<ItemContract<'_>>(str!["48"]);
         assert_size::<ItemFunction<'_>>(str!["144"]);
-        assert_size::<VariableDefinition<'_>>(str!["72"]);
+        // fhec fork patch: 72 upstream; +16 for the `in_sugar: Option<Span>` field.
+        assert_size::<VariableDefinition<'_>>(str!["88"]);
         assert_size::<ItemStruct<'_>>(str!["24"]);
         assert_size::<ItemEnum<'_>>(str!["24"]);
         assert_size::<ItemUdvt<'_>>(str!["40"]);

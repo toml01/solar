@@ -158,6 +158,7 @@ declare_visitors! {
         fn visit_variable_definition(&mut self, var: &'ast #mut VariableDefinition<'ast>) -> ControlFlow<Self::BreakValue> {
             let VariableDefinition {
                 span,
+                in_sugar: _, // fhec fork patch: `.fsol` encrypted-input sugar marker
                 ty,
                 visibility: _,
                 mutability: _,

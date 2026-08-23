@@ -698,6 +698,13 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         ty: Option<Type<'ast>>,
     ) -> PResult<'sess, VariableDefinition<'ast>> {
         let mut lo = self.token.span;
+        // fhec fork patch: optional `in` before the type marks an encrypted-input
+        // parameter (`.fsol` dialect, fhec spec §2.3). Only eaten where the flags allow
+        // it and the type has not been pre-parsed; recorded verbatim on the node.
+        let in_sugar = (ty.is_none()
+            && flags.contains(VarFlags::IN_SUGAR)
+            && self.eat_keyword(kw::In))
+        .then(|| self.prev_token.span);
         let ty = match ty {
             Some(ty) => {
                 lo = lo.with_lo(ty.span.lo());
@@ -716,6 +723,7 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             let _ = self.parse_block()?;
             return Ok(VariableDefinition {
                 span: lo.to(self.prev_token.span),
+                in_sugar, // fhec fork patch
                 ty,
                 visibility: None,
                 mutability: None,
@@ -829,6 +837,7 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
 
         Ok(VariableDefinition {
             span,
+            in_sugar, // fhec fork patch
             ty,
             data_location,
             visibility,
@@ -1128,10 +1137,18 @@ bitflags::bitflags! {
         const INITIALIZER = 1 << 12;
         const SEMI        = 1 << 13;
 
+        // fhec fork patch: accept the `.fsol` dialect's optional `in` keyword before
+        // the type (encrypted-input parameter sugar, fhec spec §2.3). The occurrence is
+        // recorded on the AST node; positional/type legality is the fhec checker's job.
+        const IN_SUGAR    = 1 << 14;
+
         const STRUCT       = Self::NAME.bits();
-        const ERROR        = 0;
-        const EVENT        = Self::INDEXED.bits();
-        const FUNCTION     = Self::DATALOC.bits();
+        // fhec fork patch: IN_SUGAR added to ERROR/EVENT/FUNCTION so the sugar
+        // parses (and is recorded) anywhere a parameter list parses, enabling a precise
+        // dialect diagnostic later instead of a generic parse error.
+        const ERROR        = Self::IN_SUGAR.bits();
+        const EVENT        = Self::INDEXED.bits() | Self::IN_SUGAR.bits();
+        const FUNCTION     = Self::DATALOC.bits() | Self::IN_SUGAR.bits();
         const FUNCTION_TY  = Self::DATALOC.bits() | Self::NAME_WARN.bits();
 
         // https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityParser.stateVariableDeclaration
