@@ -182,11 +182,7 @@ bb4:
   dup1
   push 288
   mstore
-  swap1
-  dup2
   lt
-  swap1
-  pop
   push bb12
   jumpi
   push 288

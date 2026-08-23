@@ -98,10 +98,7 @@ bb5:
   dup1
   push 224
   mstore
-  dup2
-  gt
-  swap1
-  pop
+  lt
   push bb20
   jumpi
   push bb23
@@ -187,10 +184,7 @@ bb13:
   dup1
   push 224
   mstore
-  dup2
-  gt
-  swap1
-  pop
+  lt
   push bb20
   jumpi
   push bb24
