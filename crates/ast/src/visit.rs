@@ -363,6 +363,10 @@ declare_visitors! {
                 StmtKind::UncheckedBlock(block) => {
                     self.visit_block #_mut(block)?;
                 }
+                // fhec fork patch: `.fsol` precondition block marker.
+                StmtKind::Precondition(block) => {
+                    self.visit_block #_mut(block)?;
+                }
                 StmtKind::While(cond, stmt) => {
                     self.visit_expr #_mut(cond)?;
                     self.visit_stmt #_mut(stmt)?;
