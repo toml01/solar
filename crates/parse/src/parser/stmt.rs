@@ -37,6 +37,10 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         } else if self.eat_keyword(kw::Unchecked) {
             semi = false;
             self.parse_block().map(StmtKind::UncheckedBlock)
+        } else if self.is_precondition_block() {
+            semi = false;
+            self.bump(); // `precondition`
+            self.parse_block().map(StmtKind::Precondition)
         } else if self.check(TokenKind::OpenDelim(Delimiter::Brace)) {
             semi = false;
             self.parse_block().map(StmtKind::Block)
@@ -72,6 +76,17 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             self.expect_semi()?;
         }
         kind
+    }
+
+    /// fhec fork patch: returns `true` if the parser is at a `.fsol` precondition block:
+    /// the identifier `precondition` immediately followed by `{`.
+    ///
+    /// `precondition` is a contextual keyword, not a reserved word: `identifier {` is never a
+    /// valid statement in plain Solidity, so this lookahead cannot change how any plain
+    /// Solidity source parses. No expectation is pushed, so parse errors are unchanged too.
+    fn is_precondition_block(&self) -> bool {
+        self.token.is_keyword(sym::precondition)
+            && self.look_ahead(1).kind == TokenKind::OpenDelim(Delimiter::Brace)
     }
 
     /// Parses a block of statements.
@@ -523,6 +538,108 @@ impl<'ast> IndexAccessedPath<'ast> {
 mod tests {
     use super::*;
     use solar_interface::{Result, Session, source_map::FileName};
+
+    fn session() -> Session {
+        Session::builder().with_test_emitter().single_threaded().build()
+    }
+
+    /// fhec fork patch: parses `src` as a single statement and inspects it.
+    #[track_caller]
+    fn parse_stmt_str<R>(src: &str, f: impl FnOnce(&Session, &Stmt<'_>) -> R) -> R {
+        let sess = session();
+        sess.enter_sequential(|| -> Result<R> {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            let stmt = parser.parse_stmt().map_err(|e| e.emit())?;
+            sess.dcx.has_errors()?;
+            Ok(f(&sess, &stmt))
+        })
+        .unwrap_or_else(|_| panic!("src: {src:?}"))
+    }
+
+    /// fhec fork patch: parses `src` as a whole source unit, asserting that it has no errors.
+    #[track_caller]
+    fn parse_file_ok(src: &str) {
+        let sess = session();
+        sess.enter_sequential(|| -> Result {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            let _ = parser.parse_file().map_err(|e| e.emit())?;
+            sess.dcx.has_errors()
+        })
+        .unwrap_or_else(|_| panic!("src: {src:?}"));
+    }
+
+    #[test]
+    fn precondition_block() {
+        let src = "precondition { uint256 a = 1; }";
+        parse_stmt_str(src, |sess, stmt| {
+            let StmtKind::Precondition(block) = &stmt.kind else {
+                panic!("not a precondition block: {:?}", stmt.kind)
+            };
+            let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+            assert_eq!(snip(stmt.span), src);
+            assert_eq!(snip(block.span), "{ uint256 a = 1; }");
+            // The marker alone: this is what fhec strips to leave a plain nested block.
+            assert_eq!(snip(stmt.span.with_hi(block.span.lo())), "precondition ");
+            assert_eq!(block.stmts.len(), 1);
+            assert!(matches!(block.stmts[0].kind, StmtKind::DeclSingle(_)));
+        });
+    }
+
+    #[test]
+    fn precondition_block_in_any_position() {
+        // Position legality is fhec's job, not this parser's: every statement position parses.
+        parse_stmt_str("{ a = 1; precondition { b = 2; } }", |_, stmt| {
+            let StmtKind::Block(block) = &stmt.kind else { panic!("{:?}", stmt.kind) };
+            assert_eq!(block.stmts.len(), 2);
+            assert!(matches!(block.stmts[1].kind, StmtKind::Precondition(_)));
+        });
+        parse_stmt_str("{ precondition { precondition { a = 1; } } }", |_, stmt| {
+            let StmtKind::Block(outer) = &stmt.kind else { panic!("{:?}", stmt.kind) };
+            let StmtKind::Precondition(block) = &outer.stmts[0].kind else {
+                panic!("{:?}", outer.stmts[0].kind)
+            };
+            assert!(matches!(block.stmts[0].kind, StmtKind::Precondition(_)));
+        });
+        parse_stmt_str("if (c) precondition { a = 1; }", |_, stmt| {
+            let StmtKind::If(_, then, _) = &stmt.kind else { panic!("{:?}", stmt.kind) };
+            assert!(matches!(then.kind, StmtKind::Precondition(_)));
+        });
+        parse_stmt_str("for (;;) precondition { a = 1; }", |_, stmt| {
+            let StmtKind::For { body, .. } = &stmt.kind else { panic!("{:?}", stmt.kind) };
+            assert!(matches!(body.kind, StmtKind::Precondition(_)));
+        });
+    }
+
+    #[test]
+    fn precondition_is_not_reserved() {
+        // `precondition` stays an ordinary identifier: plain Solidity parses unchanged.
+        for src in [
+            "precondition;",
+            "precondition = 1;",
+            "uint256 precondition = 1;",
+            "precondition(1);",
+            "precondition.check(1);",
+            "precondition[0] = 1;",
+        ] {
+            parse_stmt_str(src, |_, stmt| {
+                assert!(!matches!(stmt.kind, StmtKind::Precondition(_)), "src: {src:?}");
+            });
+        }
+
+        parse_file_ok(
+            "contract C {
+                uint256 precondition;
+
+                function precondition_(uint256 precondition) public returns (uint256 out) {
+                    out = precondition;
+                }
+            }",
+        );
+    }
 
     #[test]
     fn optional_items_seq() {

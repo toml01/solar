@@ -999,7 +999,11 @@ impl<'gcx> ResolveContext<'gcx> {
                 self.lower_expr(expr),
             ),
             ast::StmtKind::Assembly(assembly) => self.lower_yul_assembly(assembly),
-            ast::StmtKind::Block(stmts) => hir::StmtKind::Block(self.lower_block(stmts)),
+            // fhec fork patch: a precondition block has no semantics of its own here; it is an
+            // ordinary nested block. Only fhec reads the marker.
+            ast::StmtKind::Block(stmts) | ast::StmtKind::Precondition(stmts) => {
+                hir::StmtKind::Block(self.lower_block(stmts))
+            }
             ast::StmtKind::UncheckedBlock(stmts) => {
                 hir::StmtKind::UncheckedBlock(self.lower_block(stmts))
             }

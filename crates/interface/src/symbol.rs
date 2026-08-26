@@ -997,6 +997,8 @@ symbols! {
         name,
         object,
         offset,
+        // fhec fork patch: contextual keyword, deliberately not a reserved keyword.
+        precondition,
         push,
         require,
         ripemd160,

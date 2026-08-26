@@ -58,6 +58,8 @@ impl EnumVariantSize for ast::StmtKind<'_> {
             Self::Revert(path, args) => variant_payload_size!(self, path, args),
             Self::Try(try_) => variant_payload_size!(self, try_),
             Self::UncheckedBlock(block) => variant_payload_size!(self, block),
+            // fhec fork patch.
+            Self::Precondition(block) => variant_payload_size!(self, block),
             Self::While(cond, body) => variant_payload_size!(self, cond, body),
         }
     }
@@ -404,6 +406,8 @@ impl<'ast> Visit<'ast> for StatCollector {
                 Revert,
                 Try,
                 UncheckedBlock,
+                // fhec fork patch.
+                Precondition,
                 While,
                 Placeholder
             ]

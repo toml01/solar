@@ -92,6 +92,21 @@ pub enum StmtKind<'ast> {
     /// An unchecked block: `unchecked { ... }`.
     UncheckedBlock(Block<'ast>),
 
+    /// fhec fork patch: a precondition block: `precondition { ... }`.
+    ///
+    /// `precondition` is a contextual keyword of the `.fsol` dialect, not a reserved word: it
+    /// is only recognized when it is immediately followed by `{`, so plain Solidity that uses
+    /// `precondition` as an identifier keeps its meaning.
+    ///
+    /// The parser accepts this statement in every position where a statement is legal.
+    /// Positional legality (first statement of a body, at most one per body, and so on) is
+    /// checked by fhec, not by this parser.
+    ///
+    /// The enclosing [`Stmt::span`] starts at the `precondition` keyword and ends at the
+    /// closing `}` of the block; the inner [`Block::span`] covers only `{ ... }`. The marker
+    /// alone is therefore `stmt.span.with_hi(block.span.lo())`.
+    Precondition(Block<'ast>),
+
     /// A while statement: `while (i < 42) { ... }`.
     While(Box<'ast, Expr<'ast>>, Box<'ast, Stmt<'ast>>),
 
