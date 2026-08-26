@@ -35,9 +35,25 @@ enclosing `Stmt.span` starts at the keyword; the inner `Block.span` covers only
 strips.
 
 `precondition` is a contextual keyword, not a reserved word: the parser only
-recognizes it when the identifier is immediately followed by `{`, which is never
-a valid statement in plain Solidity. It also pushes no parse expectation, so
-error messages for plain Solidity are unchanged.
+recognizes it when the identifier is immediately followed by a `{` that opens a
+block. It also pushes no parse expectation, so error messages for plain Solidity
+are unchanged.
+
+One plain Solidity statement does start with `identifier {`: a call with
+options, `f{gas: g, value: v}(...)`. The parser looks past the `{` before it
+commits to a block:
+
+- `{ ident :` opens a call-options list. Solidity has no statement labels, so an
+  identifier followed by `:` never starts a statement. This is the same
+  lookahead that `parse_lhs_expr` uses for `expr{...}`.
+- `{}` is ambiguous. `{}(` is read as a call with an empty options list, because
+  a precondition block is never called. `solc` rejects empty call options, so
+  `precondition{}()` gets the same error as `other{}()`. A `{}` that is not
+  called is an empty precondition block.
+
+Everything else is a block. When the lookahead declines, parsing falls through
+to an ordinary expression statement, so `precondition` parses exactly like any
+other identifier.
 
 The parser accepts the block in every statement position. First-statement-only
 and at-most-one-per-body rules are fhec's, not this parser's. Semantic analysis

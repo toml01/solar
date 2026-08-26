@@ -79,14 +79,38 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
     }
 
     /// fhec fork patch: returns `true` if the parser is at a `.fsol` precondition block:
-    /// the identifier `precondition` immediately followed by `{`.
+    /// the identifier `precondition` immediately followed by a `{` that opens a block.
     ///
-    /// `precondition` is a contextual keyword, not a reserved word: `identifier {` is never a
-    /// valid statement in plain Solidity, so this lookahead cannot change how any plain
-    /// Solidity source parses. No expectation is pushed, so parse errors are unchanged too.
+    /// `precondition` is a contextual keyword, not a reserved word. One plain Solidity statement
+    /// does start with `identifier {`: a call with options, `f{gas: g, value: v}(...)`. The brace
+    /// contents tell the two apart:
+    ///
+    /// - `{ ident :` opens a call-options list. Solidity has no statement labels, so an identifier
+    ///   followed by `:` never starts a statement. This is the same lookahead that
+    ///   [`parse_lhs_expr`](Self::parse_lhs_expr) uses to tell `expr{...}` from a following block.
+    /// - `{}` is ambiguous: an empty options list and an empty block look alike. `{}(` is read as
+    ///   a call, because a precondition block is never called. A plain `{}` is an empty block.
+    ///
+    /// Anything else is a block. Declining here falls through to expression parsing, so
+    /// `precondition` parses exactly like any other identifier would. No expectation is pushed,
+    /// so parse errors are unchanged too.
     fn is_precondition_block(&self) -> bool {
-        self.token.is_keyword(sym::precondition)
-            && self.look_ahead(1).kind == TokenKind::OpenDelim(Delimiter::Brace)
+        if !self.token.is_keyword(sym::precondition)
+            || self.look_ahead(1).kind != TokenKind::OpenDelim(Delimiter::Brace)
+        {
+            return false;
+        }
+        // `precondition{a: b, ...}`: a call-options list.
+        if self.look_ahead(2).is_ident() && self.look_ahead(3).kind == TokenKind::Colon {
+            return false;
+        }
+        // `precondition{}(`: a call with an empty options list.
+        if self.look_ahead(2).kind == TokenKind::CloseDelim(Delimiter::Brace)
+            && self.look_ahead(3).kind == TokenKind::OpenDelim(Delimiter::Parenthesis)
+        {
+            return false;
+        }
+        true
     }
 
     /// Parses a block of statements.
@@ -537,7 +561,7 @@ impl<'ast> IndexAccessedPath<'ast> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solar_interface::{Result, Session, source_map::FileName};
+    use solar_interface::{ColorChoice, Result, Session, source_map::FileName};
 
     fn session() -> Session {
         Session::builder().with_test_emitter().single_threaded().build()
@@ -556,6 +580,24 @@ mod tests {
             Ok(f(&sess, &stmt))
         })
         .unwrap_or_else(|_| panic!("src: {src:?}"))
+    }
+
+    /// fhec fork patch: parses `src` as a single statement, returning the first diagnostic line.
+    #[track_caller]
+    fn parse_stmt_err(src: &str) -> String {
+        let sess =
+            Session::builder().with_buffer_emitter(ColorChoice::Never).single_threaded().build();
+        let _ = sess.enter_sequential(|| -> Result {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            parser.parse_stmt().map_err(|e| e.emit())?;
+            sess.dcx.has_errors()
+        });
+        let diags = sess.emitted_diagnostics().unwrap().to_string();
+        let first = diags.lines().next().unwrap_or_default().to_string();
+        assert!(first.starts_with("error: "), "src: {src:?}, diagnostics: {diags}");
+        first
     }
 
     /// fhec fork patch: parses `src` as a whole source unit, asserting that it has no errors.
@@ -639,6 +681,46 @@ mod tests {
                 }
             }",
         );
+    }
+
+    #[test]
+    fn precondition_call_options() {
+        // `f{gas: g, value: v}(...)` is the one plain Solidity statement that starts with
+        // `identifier {`. A callable named `precondition` must still parse as a call.
+        for src in ["precondition{value: 1}();", "precondition{gas: g, value: v}(x, y);"] {
+            parse_stmt_str(src, |_, stmt| {
+                let StmtKind::Expr(expr) = &stmt.kind else { panic!("{:?}", stmt.kind) };
+                let ExprKind::Call(callee, _) = &expr.kind else { panic!("{:?}", expr.kind) };
+                let ExprKind::CallOptions(base, opts) = &callee.kind else {
+                    panic!("{:?}", callee.kind)
+                };
+                assert!(matches!(base.kind, ExprKind::Ident(_)), "src: {src:?}");
+                assert!(!opts.is_empty(), "src: {src:?}");
+            });
+        }
+
+        parse_file_ok(
+            "contract C {
+                function() external payable precondition;
+
+                function f(uint256 g, uint256 v, uint256 x, uint256 y) public {
+                    precondition{value: 1}();
+                    precondition{gas: g, value: v}(x, y);
+                }
+            }",
+        );
+    }
+
+    #[test]
+    fn precondition_empty_braces() {
+        // `{}` is ambiguous. `{}(` is a call with an empty options list, which plain Solidity
+        // rejects: `precondition` gets the same error any other identifier does.
+        assert_eq!(parse_stmt_err("precondition{}();"), parse_stmt_err("other{}();"));
+        // A `{}` that is not called is an empty precondition block.
+        parse_stmt_str("precondition{}", |_, stmt| {
+            let StmtKind::Precondition(block) = &stmt.kind else { panic!("{:?}", stmt.kind) };
+            assert!(block.stmts.is_empty());
+        });
     }
 
     #[test]

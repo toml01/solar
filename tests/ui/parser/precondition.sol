@@ -19,3 +19,21 @@ contract Precondition {
         return precondition + x;
     }
 }
+
+// A callable named `precondition` still takes call options: `f{gas: g, value: v}(...)` is the one
+// plain Solidity statement that starts with `identifier {`.
+contract PreconditionCallOptions {
+    function() external payable precondition;
+
+    function f() public {
+        precondition{value: 1}();
+    }
+}
+
+contract PreconditionCallOptionsWithArgs {
+    function(uint256, uint256) external payable precondition;
+
+    function f(uint256 g, uint256 v, uint256 x, uint256 y) public {
+        precondition{gas: g, value: v}(x, y);
+    }
+}
