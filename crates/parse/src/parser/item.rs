@@ -701,10 +701,9 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         // fhec fork patch: optional `in` before the type marks an encrypted-input
         // parameter (`.fsol` dialect, fhec spec §2.3). Only eaten where the flags allow
         // it and the type has not been pre-parsed; recorded verbatim on the node.
-        let in_sugar = (ty.is_none()
-            && flags.contains(VarFlags::IN_SUGAR)
-            && self.eat_keyword(kw::In))
-        .then(|| self.prev_token.span);
+        let in_sugar =
+            (ty.is_none() && flags.contains(VarFlags::IN_SUGAR) && self.eat_keyword(kw::In))
+                .then(|| self.prev_token.span);
         let ty = match ty {
             Some(ty) => {
                 lo = lo.with_lo(ty.span.lo());
