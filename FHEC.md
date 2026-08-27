@@ -10,7 +10,7 @@ This is [toml01/solar](https://github.com/toml01/solar), a thin fork of
 
 ## Delta
 
-Three dialect extensions. In all of them, this parser only recognizes and
+Four dialect extensions. In all of them, this parser only recognizes and
 records the construct; legality is checked by fhec, not here.
 
 ### `in` parameter sugar (`.fsol` spec §2.3)
@@ -84,6 +84,74 @@ Touched files:
 - `crates/ast/src/visit.rs`
 - `crates/parse/src/parser/item.rs`
 - `tests/ui/parser/in_sugar.sol`
+- `tests/ui/stats/ast.stderr`
+
+### `shared` boundary marker
+
+The shared boundary has two forms, both of which mark a declaration:
+
+```text
+in shared euint64 amount            // form A, input side
+shared(msg.sender) euint64          // form B, output side
+```
+
+Both are recorded on the same new field, `VariableDefinition.shared`:
+
+```rust
+pub struct Shared<'ast> {
+    /// `shared`, or `shared` through the closing `)`.
+    pub span: Span,
+    /// The recipient expression, if form B was used.
+    pub recipient: Option<Box<'ast, Expr<'ast>>>,
+}
+```
+
+`recipient` tells the two forms apart; `Shared::has_recipient()` is the presence
+test. Form A also sets `in_sugar`, since it can only follow `in`; form B does
+not, since it carries no `in` keyword. The two compose: `in shared(a) euint64 x`
+sets both, and fhec decides whether that is legal.
+
+`shared` is a contextual keyword, not a reserved word, so it is only read as a
+marker where plain Solidity has no other reading:
+
+- Form A needs the reserved `in` in front of it. Nothing in plain Solidity may
+  follow `in` in a declaration. Without `in`, a bare `shared` is left alone:
+  `shared x;` stays a declaration of type `shared`.
+- Form B needs the `(` right after it. `ident(...)` is never a `TypeName`, so a
+  type position that starts with `shared(` has one reading.
+
+Both checks peek with `Token::is_keyword`, which pushes no expectation, so parse
+errors for plain Solidity are unchanged. `uint256 shared;`,
+`function shared() {}`, `x.shared()` and a parameter named `shared` all parse as
+before.
+
+Once `shared(` is seen the construct is committed to, like the `in(proof)`
+binder: exactly one recipient expression is required, and `shared()`,
+`shared(a, b)` or an unterminated `shared(a` is a hard parse error. Any
+expression is accepted as a recipient; which ones are valid is fhec's job.
+
+Form A is gated by `VarFlags::IN_SUGAR`, so it parses wherever the `in` sugar
+does. Form B is gated by a new `VarFlags::SHARED`, set on function, error and
+event parameter lists (and therefore on `returns` lists, which share the flags)
+and on state variable declarations.
+
+Unlike the `in(proof)` binder, the AST visitor *does* walk the recipient: it is
+an ordinary expression, not a name resolved against the parameter list.
+
+`VariableDefinition` grows from 104 to 128 bytes. `Shared` is 16, and it spends
+the box's niche on its own `Option`, so `Option<Shared>` costs 24. `ItemKind`
+and `Item` grow with it, to 152 and 168. All are asserted in
+`crates/ast/src/ast/mod.rs`.
+
+Touched files:
+
+- `crates/ast/src/ast/item.rs`
+- `crates/ast/src/ast/mod.rs`
+- `crates/ast/src/visit.rs`
+- `crates/interface/src/symbol.rs`
+- `crates/parse/src/parser/item.rs`
+- `crates/sema/src/ast_lowering/lower.rs`
+- `tests/ui/parser/shared.sol`
 - `tests/ui/stats/ast.stderr`
 
 ### `precondition` block
