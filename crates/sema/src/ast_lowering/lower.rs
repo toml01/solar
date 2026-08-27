@@ -427,6 +427,7 @@ pub(super) fn lower_variable_partial(
     let ast::VariableDefinition {
         span,
         in_sugar: _, // fhec fork patch: `.fsol` encrypted-input sugar marker, unused here
+        shared: _,   // fhec fork patch: `.fsol` shared-boundary marker, unused here
         ty: _,
         visibility,
         mutability,

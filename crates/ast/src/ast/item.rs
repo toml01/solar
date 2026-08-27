@@ -761,6 +761,43 @@ impl InSugar {
     }
 }
 
+/// fhec fork patch (`.fsol` dialect extension): the shared-boundary marker of a
+/// [`VariableDefinition`].
+///
+/// Two forms are parsed, told apart by [`Self::recipient`]:
+///
+/// ```text
+/// in shared euint64 amount           // form A, input side: `recipient` is `None`
+/// shared(msg.sender) euint64         // form B, output side: `recipient` is `Some`
+/// ```
+///
+/// Form A is a bare marker between the `in` sugar and the type, so it only appears
+/// together with [`VariableDefinition::in_sugar`]. Form B is a type-position construct
+/// that stands on its own: it carries no `in` keyword, so `in_sugar` is `None` unless the
+/// two were written together (`in shared(msg.sender) euint64 x`, which is accepted and
+/// left to the fhec checker to judge).
+///
+/// The parser only records the marker. Which expressions may name a recipient, and where
+/// either form is legal at all, is decided by the fhec checker, not here.
+///
+/// The whole marker is [`Self::span`]; the type that follows it starts at
+/// `VariableDefinition::ty.span.lo()`, the same shape the `in` marker uses.
+#[derive(Debug)]
+pub struct Shared<'ast> {
+    /// The span of the marker: the `shared` keyword alone in form A, or `shared` through
+    /// the closing `)` of the recipient in form B.
+    pub span: Span,
+    /// The recipient expression of `shared(...)`, if form B was used.
+    pub recipient: Option<Box<'ast, Expr<'ast>>>,
+}
+
+impl Shared<'_> {
+    /// Returns `true` if the `shared(recipient)` form was used.
+    pub fn has_recipient(&self) -> bool {
+        self.recipient.is_some()
+    }
+}
+
 /// A state variable or constant definition: `uint256 constant FOO = 42;`.
 ///
 /// Reference: <https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityParser.stateVariableDeclaration>
@@ -773,6 +810,13 @@ pub struct VariableDefinition<'ast> {
     /// Solidity sources. Whether the sugar is *legal* in this position is decided by the
     /// fhec checker, not the parser.
     pub in_sugar: Option<InSugar>,
+    /// fhec fork patch (`.fsol` dialect extension): set when this variable was declared
+    /// with a shared-boundary marker, `in shared euint64 amount` or
+    /// `shared(msg.sender) euint64`. Always `None` for plain Solidity sources: `shared` is
+    /// a contextual keyword, recognized only right after the reserved `in` keyword or when
+    /// immediately followed by `(` in a declaration's type position. Whether the marker is
+    /// *legal* in this position is decided by the fhec checker, not the parser.
+    pub shared: Option<Shared<'ast>>,
     pub ty: Type<'ast>,
     pub visibility: Option<Visibility>,
     pub mutability: Option<VarMut>,

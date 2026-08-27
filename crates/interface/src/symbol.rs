@@ -1008,6 +1008,8 @@ symbols! {
         send,
         sender,
         sha256,
+        // fhec fork patch: contextual keyword, deliberately not a reserved keyword.
+        shared,
         sig,
         slot,
         solidity,

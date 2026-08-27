@@ -206,18 +206,21 @@ mod tests {
         assert_size::<UsingDirective<'_>>(str!["48"]);
         assert_size::<ItemContract<'_>>(str!["48"]);
         assert_size::<ItemFunction<'_>>(str!["144"]);
-        // fhec fork patch: 72 upstream; +32 for the `in_sugar: Option<InSugar>` field.
-        // `InSugar` is `Span` + `Span` + `Option<Ident>` = 28, and `Span` has no niche, so
-        // `Option<InSugar>` costs 32.
-        assert_size::<VariableDefinition<'_>>(str!["104"]);
+        // fhec fork patch: 72 upstream; +32 for the `in_sugar: Option<InSugar>` field and
+        // +24 for the `shared: Option<Shared>` field. `InSugar` is `Span` + `Span` +
+        // `Option<Ident>` = 28, and `Span` has no niche, so `Option<InSugar>` costs 32.
+        // `Shared` is `Span` + `Option<Box<Expr>>` = 16, and it spends the box's niche on
+        // its own `Option`, so `Option<Shared>` costs 24.
+        assert_size::<VariableDefinition<'_>>(str!["128"]);
         assert_size::<InSugar>(str!["28"]);
+        assert_size::<Shared<'_>>(str!["16"]);
         assert_size::<ItemStruct<'_>>(str!["24"]);
         assert_size::<ItemEnum<'_>>(str!["24"]);
         assert_size::<ItemUdvt<'_>>(str!["40"]);
         assert_size::<ItemError<'_>>(str!["32"]);
         assert_size::<ItemEvent<'_>>(str!["32"]);
-        assert_size::<ItemKind<'_>>(str!["144"]);
-        assert_size::<Item<'_>>(str!["160"]);
+        assert_size::<ItemKind<'_>>(str!["152"]); // fhec fork patch: the `VariableDefinition` variant grew
+        assert_size::<Item<'_>>(str!["168"]); // fhec fork patch: see `ItemKind`
 
         assert_size::<FunctionHeader<'_>>(str!["112"]);
         assert_size::<ParameterList<'_>>(str!["16"]);

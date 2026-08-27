@@ -719,6 +719,10 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             } else {
                 None
             };
+        // fhec fork patch: the `.fsol` shared-boundary marker, which sits directly before
+        // the type. See `parse_shared_marker`.
+        let shared =
+            if ty.is_none() { self.parse_shared_marker(flags, in_sugar.is_some())? } else { None };
         let ty = match ty {
             Some(ty) => {
                 lo = lo.with_lo(ty.span.lo());
@@ -738,6 +742,7 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             return Ok(VariableDefinition {
                 span: lo.to(self.prev_token.span),
                 in_sugar, // fhec fork patch
+                shared,   // fhec fork patch
                 ty,
                 visibility: None,
                 mutability: None,
@@ -852,6 +857,7 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         Ok(VariableDefinition {
             span,
             in_sugar, // fhec fork patch
+            shared,   // fhec fork patch
             ty,
             data_location,
             visibility,
@@ -861,6 +867,61 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
             name,
             initializer,
         })
+    }
+
+    /// fhec fork patch: parses the `.fsol` shared-boundary marker that precedes a
+    /// declaration's type, if there is one.
+    ///
+    /// Two forms, both ending right before the type:
+    ///
+    /// ```text
+    /// in shared euint64 amount       // form A, input side: recorded with no recipient
+    /// shared(msg.sender) euint64     // form B, output side: recorded with the recipient
+    /// ```
+    ///
+    /// `shared` is a contextual keyword, not a reserved word, so it is only read as a
+    /// marker where plain Solidity cannot mean anything else:
+    ///
+    /// - Form A needs the reserved `in` keyword in front of it (`after_in`). Nothing in
+    ///   plain Solidity may follow `in` in a declaration, so a bare `shared` there has one
+    ///   reading. Without `in`, a bare `shared` is left alone: `shared x;` is a plain
+    ///   declaration of type `shared`.
+    /// - Form B needs the `(` right after it. `ident(...)` is never a `TypeName`, so a
+    ///   declaration whose type position starts with `shared(` has one reading too.
+    ///
+    /// Both checks peek without pushing an expectation, so declining leaves no trace in
+    /// parse errors and `shared` keeps parsing as the ordinary identifier it is.
+    ///
+    /// Once form B is committed to, the recipient is parsed strictly: exactly one
+    /// expression between the parens. `shared()`, `shared(a, b)` and an unterminated
+    /// `shared(a` are parse errors, not a silent fall back to an ordinary type. This
+    /// mirrors the `in(proof)` binder. Which expressions are *valid* recipients is the
+    /// fhec checker's call, so any expression is accepted here.
+    fn parse_shared_marker(
+        &mut self,
+        flags: VarFlags,
+        after_in: bool,
+    ) -> PResult<'sess, Option<Shared<'ast>>> {
+        if !self.token.is_keyword(sym::shared) {
+            return Ok(None);
+        }
+        let lo = self.token.span;
+        let has_paren = self.look_ahead(1).kind == TokenKind::OpenDelim(Delimiter::Parenthesis);
+        if has_paren {
+            if !flags.contains(VarFlags::SHARED) {
+                return Ok(None);
+            }
+            self.bump(); // `shared`
+            self.bump(); // `(`
+            let recipient = self.parse_expr()?;
+            self.expect(TokenKind::CloseDelim(Delimiter::Parenthesis))?;
+            Ok(Some(Shared { span: lo.to(self.prev_token.span), recipient: Some(recipient) }))
+        } else if after_in {
+            self.bump(); // `shared`
+            Ok(Some(Shared { span: lo, recipient: None }))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Parses mutability of a variable: `constant | immutable`.
@@ -1156,17 +1217,25 @@ bitflags::bitflags! {
         // recorded on the AST node; positional/type legality is the fhec checker's job.
         const IN_SUGAR    = 1 << 14;
 
+        // fhec fork patch: accept the `.fsol` dialect's `shared(recipient)` marker in this
+        // declaration's type position (shared-boundary output side). The bare `in shared`
+        // marker is gated by `IN_SUGAR` instead, since it can only follow `in`.
+        const SHARED      = 1 << 15;
+
         const STRUCT       = Self::NAME.bits();
         // fhec fork patch: IN_SUGAR added to ERROR/EVENT/FUNCTION so the sugar
         // parses (and is recorded) anywhere a parameter list parses, enabling a precise
-        // dialect diagnostic later instead of a generic parse error.
-        const ERROR        = Self::IN_SUGAR.bits();
-        const EVENT        = Self::INDEXED.bits() | Self::IN_SUGAR.bits();
-        const FUNCTION     = Self::DATALOC.bits() | Self::IN_SUGAR.bits();
+        // dialect diagnostic later instead of a generic parse error. SHARED rides along,
+        // and is also set on STATE_VAR: the marker is recorded wherever it can be written
+        // unambiguously, and the fhec checker decides where it is legal.
+        const ERROR        = Self::IN_SUGAR.bits() | Self::SHARED.bits();
+        const EVENT        = Self::INDEXED.bits() | Self::IN_SUGAR.bits() | Self::SHARED.bits();
+        const FUNCTION     = Self::DATALOC.bits() | Self::IN_SUGAR.bits() | Self::SHARED.bits();
         const FUNCTION_TY  = Self::DATALOC.bits() | Self::NAME_WARN.bits();
 
         // https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityParser.stateVariableDeclaration
-        const STATE_VAR    = Self::DATALOC.bits()
+        const STATE_VAR    = Self::SHARED.bits() // fhec fork patch
+                           | Self::DATALOC.bits()
                            | Self::PRIVATE.bits()
                            | Self::INTERNAL.bits()
                            | Self::PUBLIC.bits()
@@ -1926,5 +1995,266 @@ mod tests {
         // `in` is not eaten outside `VarFlags::IN_SUGAR` positions, so `in(...)` is not
         // read as a binder there either. State variables reject it as plain Solidity does.
         parse_fn_err("function f() external { in(inputProof) euint32 a; }");
+    }
+
+    /// fhec fork patch: parses `src` as a contract-level function and inspects its
+    /// `returns` list.
+    #[track_caller]
+    fn parse_fn_returns<R>(
+        src: &str,
+        f: impl FnOnce(&Session, &[VariableDefinition<'_>]) -> R,
+    ) -> R {
+        let sess = session();
+        sess.enter_sequential(|| -> Result<R> {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            parser.in_contract = true;
+            let func = parser.parse_function().map_err(|e| e.emit())?;
+            sess.dcx.has_errors()?;
+            let returns = func.header.returns.as_ref().expect("no returns list");
+            Ok(f(&sess, returns.vars))
+        })
+        .unwrap_or_else(|_| panic!("src: {src:?}"))
+    }
+
+    /// fhec fork patch: parses `src` as one contract-level item and inspects it.
+    #[track_caller]
+    fn parse_contract_item<R>(src: &str, f: impl FnOnce(&Session, &ItemKind<'_>) -> R) -> R {
+        let sess = session();
+        sess.enter_sequential(|| -> Result<R> {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            parser.in_contract = true;
+            let item = parser.parse_item().map_err(|e| e.emit())?.expect("no item");
+            sess.dcx.has_errors()?;
+            Ok(f(&sess, &item.kind))
+        })
+        .unwrap_or_else(|_| panic!("src: {src:?}"))
+    }
+
+    /// fhec fork patch: parses `src` as a whole source unit, asserting that it parses
+    /// without diagnostics.
+    #[track_caller]
+    fn parse_src_ok(src: &str) {
+        let sess = session();
+        sess.enter_sequential(|| -> Result {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            parser.parse_file().map_err(|e| e.emit())?;
+            sess.dcx.has_errors()
+        })
+        .unwrap_or_else(|_| panic!("src: {src:?}"));
+    }
+
+    #[test]
+    fn shared_input_marker() {
+        // Form A: `in shared eT name`. Both markers are recorded; the shared one carries no
+        // recipient, and its span is the keyword alone.
+        parse_fn_params("function f(in shared euint64 amount) external {}", |sess, params| {
+            let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+            assert_eq!(params.len(), 1);
+            let sugar = params[0].in_sugar.expect("no in_sugar");
+            assert_eq!(snip(sugar.span), "in");
+            assert_eq!(sugar.proof, None);
+            let shared = params[0].shared.as_ref().expect("no shared");
+            assert_eq!(snip(shared.span), "shared");
+            assert!(shared.recipient.is_none());
+            assert!(!shared.has_recipient());
+            assert_eq!(snip(params[0].ty.span), "euint64");
+            // Both markers stop before the type, so fhec strips `span.until(ty.span)`.
+            assert_eq!(snip(sugar.span.until(params[0].ty.span)), "in shared ");
+        });
+
+        // The `in(proof)` binder and the shared marker compose.
+        parse_fn_params(
+            "function f(in(p) shared euint64 a, bytes calldata p) external {}",
+            |sess, params| {
+                let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+                let sugar = params[0].in_sugar.expect("no in_sugar");
+                assert_eq!(snip(sugar.span), "in(p)");
+                assert_eq!(sugar.proof.expect("no proof").as_str(), "p");
+                assert_eq!(snip(params[0].shared.as_ref().expect("no shared").span), "shared");
+                assert!(params[1].shared.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn in_sugar_without_shared_is_unchanged() {
+        // Regression: the legacy `in eT name` form records no shared marker.
+        for src in [
+            "function f(in euint32 amount) external {}",
+            "function f(in(p) euint32 amount, bytes calldata p) external {}",
+            "function f(uint256 a) external {}",
+        ] {
+            parse_fn_params(src, |_, params| {
+                assert!(params.iter().all(|p| p.shared.is_none()), "src: {src:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn shared_return_marker() {
+        // Form B: `shared(recipient) eT` in a `returns` list. No `in` is involved.
+        parse_fn_returns(
+            "function f() external returns (shared(msg.sender) euint64) {}",
+            |sess, returns| {
+                let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+                assert_eq!(returns.len(), 1);
+                assert!(returns[0].in_sugar.is_none());
+                let shared = returns[0].shared.as_ref().expect("no shared");
+                assert_eq!(snip(shared.span), "shared(msg.sender)");
+                let recipient = shared.recipient.as_ref().expect("no recipient");
+                assert_eq!(snip(recipient.span), "msg.sender");
+                assert!(matches!(recipient.kind, ExprKind::Member(..)));
+                // The type after the closing paren is parsed as usual.
+                assert_eq!(snip(returns[0].ty.span), "euint64");
+                assert!(returns[0].name.is_none());
+            },
+        );
+
+        // A named shared return still names the variable.
+        parse_fn_returns(
+            "function f() external returns (shared(msg.sender) euint64 out) {}",
+            |sess, returns| {
+                let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+                assert!(returns[0].shared.as_ref().expect("no shared").recipient.is_some());
+                assert_eq!(snip(returns[0].ty.span), "euint64");
+                assert_eq!(returns[0].name.expect("no name").as_str(), "out");
+            },
+        );
+
+        // Any expression is accepted; which ones are valid recipients is fhec's call.
+        for recipient in ["msg.sender", "owner", "owners[0]", "a.b.c", "f(x)", "1 + 2"] {
+            let src = format!("function f() external returns (shared({recipient}) euint64) {{}}");
+            parse_fn_returns(&src, |sess, returns| {
+                let got = returns[0].shared.as_ref().expect("no shared");
+                let got = got.recipient.as_ref().expect("no recipient");
+                let snip = sess.source_map().span_to_snippet(got.span).unwrap();
+                assert_eq!(snip, recipient, "src: {src:?}");
+            });
+        }
+
+        // It is also accepted in a parameter list, with or without `in`.
+        parse_fn_params("function f(shared(msg.sender) euint64 a) external {}", |_, params| {
+            assert!(params[0].in_sugar.is_none());
+            assert!(params[0].shared.as_ref().expect("no shared").recipient.is_some());
+        });
+        parse_fn_params("function f(in shared(msg.sender) euint64 a) external {}", |_, params| {
+            assert!(params[0].in_sugar.is_some());
+            assert!(params[0].shared.as_ref().expect("no shared").recipient.is_some());
+        });
+    }
+
+    #[test]
+    fn shared_return_marker_malformed_is_an_error() {
+        // Once `shared(` is seen the construct is committed to, exactly like the `in(proof)`
+        // binder: `ident(` is never a type, so there is nothing to fall back to. Exactly one
+        // recipient expression is required.
+        for src in [
+            "function f() external returns (shared() euint64) {}",
+            "function f() external returns (shared(,) euint64) {}",
+            "function f() external returns (shared(1, 2) euint64) {}",
+            "function f() external returns (shared(msg.sender euint64) {}",
+            "function f(shared() euint64 a) external {}",
+        ] {
+            parse_fn_err(src);
+        }
+    }
+
+    #[test]
+    fn shared_in_other_declaration_positions() {
+        // Allow and flag: events, errors and state variables record the marker too, so fhec
+        // can give a precise dialect diagnostic instead of a generic parse error.
+        parse_contract_item("event E(shared(msg.sender) uint256 a);", |_, kind| {
+            let ItemKind::Event(event) = kind else { panic!("{kind:?}") };
+            assert!(event.parameters[0].shared.as_ref().expect("no shared").recipient.is_some());
+        });
+        parse_contract_item("error E(shared(msg.sender) uint256 a);", |_, kind| {
+            let ItemKind::Error(error) = kind else { panic!("{kind:?}") };
+            assert!(error.parameters[0].shared.as_ref().expect("no shared").recipient.is_some());
+        });
+        parse_contract_item("shared(msg.sender) uint256 public a;", |sess, kind| {
+            let ItemKind::Variable(var) = kind else { panic!("{kind:?}") };
+            let shared = var.shared.as_ref().expect("no shared");
+            assert!(shared.recipient.is_some());
+            let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+            assert_eq!(snip(shared.span), "shared(msg.sender)");
+            assert_eq!(snip(var.ty.span), "uint256");
+            assert_eq!(var.name.expect("no name").as_str(), "a");
+        });
+        // Events and errors take the `in shared` form too, since they take `in`.
+        parse_contract_item("event E(in shared uint256 a);", |_, kind| {
+            let ItemKind::Event(event) = kind else { panic!("{kind:?}") };
+            let shared = event.parameters[0].shared.as_ref().expect("no shared");
+            assert!(shared.recipient.is_none());
+        });
+    }
+
+    #[test]
+    fn shared_is_not_reserved() {
+        // `shared` stays an ordinary identifier: plain Solidity parses unchanged.
+        parse_src_ok(
+            "contract C {
+                uint256 shared;
+                uint256 public shared2 = shared;
+                mapping(address => uint256) shared3;
+
+                function shared() external returns (uint256) { return 1; }
+
+                function g(uint256 shared) external returns (uint256 shared_) {
+                    shared_ = shared;
+                    shared = 5;
+                    shared_ = shared_ + shared;
+                }
+
+                function h(C x) external {
+                    x.shared();
+                    shared();
+                }
+
+                event shared(uint256 a);
+                error shared_(uint256 a);
+                struct S { uint256 shared; }
+                modifier shared__(uint256 shared) { _; }
+            }",
+        );
+
+        // A parameter or return *named* `shared` is an ordinary name, not a marker.
+        parse_fn_returns("function f() external returns (uint256 shared) {}", |sess, returns| {
+            let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+            assert!(returns[0].shared.is_none());
+            assert_eq!(snip(returns[0].ty.span), "uint256");
+            assert_eq!(returns[0].name.expect("no name").as_str(), "shared");
+        });
+        parse_fn_params("function f(uint256 shared) external {}", |_, params| {
+            assert!(params[0].shared.is_none());
+            assert_eq!(params[0].name.expect("no name").as_str(), "shared");
+        });
+
+        // A declaration whose *type* is a user-defined `shared` is untouched: the marker
+        // needs either a preceding `in` or an immediate `(`.
+        parse_contract_item("shared public a;", |sess, kind| {
+            let ItemKind::Variable(var) = kind else { panic!("{kind:?}") };
+            assert!(var.shared.is_none());
+            let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+            assert_eq!(snip(var.ty.span), "shared");
+            assert_eq!(var.name.expect("no name").as_str(), "a");
+        });
+        parse_fn_params("function f(shared a) external {}", |sess, params| {
+            let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+            assert!(params[0].shared.is_none());
+            assert_eq!(snip(params[0].ty.span), "shared");
+        });
+
+        // `shared` is not pushed as an expectation, so unrelated errors are unchanged.
+        assert_eq!(
+            parse_fn_err("function f(uint256 a, ) external {}"),
+            parse_fn_err("function f(uint256 a, ) external {}"),
+        );
+        assert!(!parse_fn_err("function f() external returns (,) {}").contains("shared"));
     }
 }
