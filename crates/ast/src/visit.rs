@@ -162,6 +162,9 @@ declare_visitors! {
                 // visited: the `in(proof)` binder is resolved by fhec against the enclosing
                 // parameter list, not by this crate's name resolution.
                 in_sugar: _,
+                // fhec fork patch: `.fsol` shared-boundary marker. The recipient of the
+                // `shared(...)` form is an ordinary expression, so it is walked.
+                shared,
                 ty,
                 visibility: _,
                 mutability: _,
@@ -172,6 +175,13 @@ declare_visitors! {
                 initializer,
             } = var;
             self.visit_span #_mut(span)?;
+            if let Some(shared) = shared {
+                let Shared { span, recipient } = shared;
+                self.visit_span #_mut(span)?;
+                if let Some(recipient) = recipient {
+                    self.visit_expr #_mut(recipient)?;
+                }
+            }
             self.visit_ty #_mut(ty)?;
             if let Some(name) = name {
                 self.visit_ident #_mut(name)?;
