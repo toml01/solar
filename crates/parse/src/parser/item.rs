@@ -702,8 +702,23 @@ impl<'sess, 'ast, 'cb> Parser<'sess, 'ast, 'cb> {
         // parameter (`.fsol` dialect, fhec spec §2.3). Only eaten where the flags allow
         // it and the type has not been pre-parsed; recorded verbatim on the node.
         let in_sugar =
-            (ty.is_none() && flags.contains(VarFlags::IN_SUGAR) && self.eat_keyword(kw::In))
-                .then(|| self.prev_token.span);
+            if ty.is_none() && flags.contains(VarFlags::IN_SUGAR) && self.eat_keyword(kw::In) {
+                let kw_span = self.prev_token.span;
+                // An optional `(proof)` binder names the proof parameter this input decrypts
+                // with. No type starts with `(`, so the paren is unambiguous and the binder is
+                // parsed strictly: a malformed one is a parse error, not a fallback to the
+                // implicit form.
+                let proof = if self.eat(TokenKind::OpenDelim(Delimiter::Parenthesis)) {
+                    let proof = self.parse_ident()?;
+                    self.expect(TokenKind::CloseDelim(Delimiter::Parenthesis))?;
+                    Some(proof)
+                } else {
+                    None
+                };
+                Some(InSugar { span: kw_span.to(self.prev_token.span), kw_span, proof })
+            } else {
+                None
+            };
         let ty = match ty {
             Some(ty) => {
                 lo = lo.with_lo(ty.span.lo());
@@ -1395,7 +1410,7 @@ fn common_flags_error<T: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solar_interface::{Result, Session, source_map::FileName};
+    use solar_interface::{ColorChoice, Result, Session, source_map::FileName};
 
     fn session() -> Session {
         Session::builder().with_test_emitter().single_threaded().build()
@@ -1771,5 +1786,145 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// fhec fork patch: parses `src` as a contract-level function and inspects its
+    /// parameter list.
+    #[track_caller]
+    fn parse_fn_params<R>(
+        src: &str,
+        f: impl FnOnce(&Session, &[VariableDefinition<'_>]) -> R,
+    ) -> R {
+        let sess = session();
+        sess.enter_sequential(|| -> Result<R> {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            parser.in_contract = true;
+            let func = parser.parse_function().map_err(|e| e.emit())?;
+            sess.dcx.has_errors()?;
+            Ok(f(&sess, func.header.parameters.vars))
+        })
+        .unwrap_or_else(|_| panic!("src: {src:?}"))
+    }
+
+    /// fhec fork patch: parses `src` as a contract-level function, returning the first
+    /// diagnostic line. Asserts that parsing did fail.
+    #[track_caller]
+    fn parse_fn_err(src: &str) -> String {
+        let sess =
+            Session::builder().with_buffer_emitter(ColorChoice::Never).single_threaded().build();
+        let _ = sess.enter_sequential(|| -> Result {
+            let arena = Arena::new();
+            let mut parser =
+                Parser::from_source_code(&sess, &arena, FileName::Custom(src.to_string()), src)?;
+            parser.in_contract = true;
+            parser.parse_function().map_err(|e| e.emit())?;
+            sess.dcx.has_errors()
+        });
+        let diags = sess.emitted_diagnostics().unwrap().to_string();
+        let first = diags.lines().next().unwrap_or_default().to_string();
+        assert!(first.starts_with("error: "), "src: {src:?}, diagnostics: {diags}");
+        first
+    }
+
+    #[test]
+    fn in_sugar_implicit() {
+        // Regression: the legacy form is unchanged. No binder is recorded, and the marker
+        // span is the `in` keyword alone.
+        parse_fn_params("function f(in euint32 amount) external {}", |sess, params| {
+            let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+            assert_eq!(params.len(), 1);
+            let sugar = params[0].in_sugar.expect("no in_sugar");
+            assert_eq!(snip(sugar.kw_span), "in");
+            assert_eq!(snip(sugar.span), "in");
+            assert_eq!(sugar.proof, None);
+            assert!(!sugar.is_explicit());
+            assert_eq!(snip(params[0].ty.span), "euint32");
+        });
+
+        // A plain parameter still records nothing.
+        parse_fn_params("function f(uint256 a, bytes calldata b) external {}", |_, params| {
+            assert_eq!(params.len(), 2);
+            assert!(params.iter().all(|p| p.in_sugar.is_none()));
+        });
+    }
+
+    #[test]
+    fn in_sugar_explicit_proof_binder() {
+        parse_fn_params(
+            "function f(in(inputProof) euint32 amount, bytes calldata inputProof) external {}",
+            |sess, params| {
+                let snip = |span| sess.source_map().span_to_snippet(span).unwrap();
+                assert_eq!(params.len(), 2);
+                let sugar = params[0].in_sugar.expect("no in_sugar");
+                assert!(sugar.is_explicit());
+                // The keyword span never covers the binder; the marker span does.
+                assert_eq!(snip(sugar.kw_span), "in");
+                assert_eq!(snip(sugar.span), "in(inputProof)");
+                let proof = sugar.proof.expect("no proof binder");
+                assert_eq!(proof.as_str(), "inputProof");
+                assert_eq!(snip(proof.span), "inputProof");
+                // The marker stops before the type, so fhec can strip `span.to(ty.span)`.
+                assert_eq!(snip(sugar.span.until(params[0].ty.span)), "in(inputProof) ");
+                // The proof parameter itself is an ordinary parameter.
+                assert!(params[1].in_sugar.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn in_sugar_proof_binder_is_a_plain_ident() {
+        // Any identifier is accepted; resolving it against the parameter list is fhec's job.
+        for name in ["inputProof", "proof", "_proof", "$proof", "In", "from", "error"] {
+            let src = format!("function f(in({name}) euint32 amount) external {{}}");
+            parse_fn_params(&src, |_, params| {
+                let proof = params[0].in_sugar.expect("no in_sugar").proof.expect("no proof");
+                assert_eq!(proof.as_str(), name, "src: {src:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn in_sugar_binder_whitespace() {
+        // Tokens, not bytes: no type can start with `(`, so the paren is unambiguous
+        // wherever the lexer puts it. Whitespace and comments are allowed throughout.
+        for src in [
+            "function f(in (inputProof) euint32 a) external {}",
+            "function f(in( inputProof ) euint32 a) external {}",
+            "function f(in\n(inputProof)\neuint32 a) external {}",
+            "function f(in /* p */ (inputProof) euint32 a) external {}",
+        ] {
+            parse_fn_params(src, |sess, params| {
+                let sugar = params[0].in_sugar.expect("no in_sugar");
+                assert_eq!(sugar.proof.expect("no proof").as_str(), "inputProof", "src: {src:?}");
+                // The marker span still ends at the closing paren.
+                let snip = sess.source_map().span_to_snippet(sugar.span).unwrap();
+                assert!(snip.starts_with("in") && snip.ends_with(')'), "src: {src:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn in_sugar_binder_malformed_is_an_error() {
+        // A malformed binder is a hard parse error. It never falls back to the implicit
+        // form: `in(` has no other reading.
+        for src in [
+            "function f(in() euint32 a) external {}",
+            "function f(in(123) euint32 a) external {}",
+            "function f(in(a, b) euint32 a) external {}",
+            "function f(in(a euint32 a) external {}",
+            "function f(in(\"p\") euint32 a) external {}",
+            "function f(in(a.b) euint32 a) external {}",
+        ] {
+            parse_fn_err(src);
+        }
+    }
+
+    #[test]
+    fn in_sugar_binder_only_where_the_sugar_is_allowed() {
+        // `in` is not eaten outside `VarFlags::IN_SUGAR` positions, so `in(...)` is not
+        // read as a binder there either. State variables reject it as plain Solidity does.
+        parse_fn_err("function f() external { in(inputProof) euint32 a; }");
     }
 }
