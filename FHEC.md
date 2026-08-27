@@ -10,8 +10,8 @@ This is [toml01/solar](https://github.com/toml01/solar), a thin fork of
 
 ## Delta
 
-Two dialect extensions. In both, this parser only recognizes and records the
-construct; legality is checked by fhec, not here.
+Three dialect extensions. In all of them, this parser only recognizes and
+records the construct; legality is checked by fhec, not here.
 
 ### `in` parameter sugar (`.fsol` spec §2.3)
 
@@ -26,6 +26,65 @@ Touched files:
 - `crates/ast/src/visit.rs`
 - `crates/parse/src/parser/item.rs`
 - `crates/sema/src/ast_lowering/lower.rs`
+
+### `in(proof)` explicit proof binder
+
+The `in` marker takes an optional parenthesized identifier that names the proof
+parameter of the same list:
+
+```text
+in euint32 amount               // implicit: the binder is absent
+in(inputProof) euint32 amount   // explicit: the binder is `inputProof`
+```
+
+`VariableDefinition.in_sugar` is `Option<InSugar>`:
+
+```rust
+pub struct InSugar {
+    /// `in`, or `in` through the closing `)`.
+    pub span: Span,
+    /// The `in` keyword alone. Equal to `span` in the implicit form.
+    pub kw_span: Span,
+    /// The bound identifier, if the explicit form was used.
+    pub proof: Option<Ident>,
+}
+```
+
+A struct, not two flat fields, because the two spans and the binder are one
+marker: `Some` means "sugared", and the binder can only exist inside it. The
+fork's own code reads `in_sugar` in four places, all of which ignore it, so the
+change costs nothing here. `InSugar::is_explicit()` is the presence test.
+
+`VariableDefinition` grows from 88 to 104 bytes: `InSugar` is 28, and `Span` has
+no niche, so `Option<InSugar>` costs 32 instead of the 16 of the old
+`Option<Span>`. Both numbers are asserted in `crates/ast/src/ast/mod.rs`.
+
+The marker ends before the type, so `var.span.with_hi(var.ty.span.lo())` is the
+text fhec strips, the same shape the `precondition` marker uses.
+
+The binder is parsed from tokens, so whitespace and comments are free:
+`in (inputProof)` and `in /* p */ (inputProof)` are the same as `in(inputProof)`.
+This is safe because no Solidity type starts with `(`, so the paren after `in`
+has exactly one reading. Unlike `precondition`, there is nothing to be lenient
+about: once the reserved `in` keyword is eaten, a `(` must be a binder. A
+malformed binder (`in()`, `in(123)`, `in(a, b)`, an unterminated `in(a`) is a
+hard parse error, not a silent fall back to the implicit form.
+
+The parser accepts the binder wherever the `in` sugar is accepted, which is
+function, error and event parameter lists (`VarFlags::IN_SUGAR`). Whether the
+binder names a `bytes memory|calldata` parameter of the same list, and whether
+the implicit and explicit forms are illegally mixed, is fhec's job. The AST
+visitor deliberately does not visit the bound identifier: it is resolved by fhec
+against the parameter list, not by this crate's name resolution.
+
+Touched files:
+
+- `crates/ast/src/ast/item.rs`
+- `crates/ast/src/ast/mod.rs`
+- `crates/ast/src/visit.rs`
+- `crates/parse/src/parser/item.rs`
+- `tests/ui/parser/in_sugar.sol`
+- `tests/ui/stats/ast.stderr`
 
 ### `precondition` block
 

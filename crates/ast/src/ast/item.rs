@@ -726,18 +726,53 @@ impl Visibility {
     }
 }
 
+/// fhec fork patch (`.fsol` dialect extension, fhec spec §2.3): the encrypted-input
+/// parameter sugar marker of a [`VariableDefinition`].
+///
+/// Two forms are parsed:
+///
+/// ```text
+/// in euint32 amount               // implicit proof: `proof` is `None`
+/// in(inputProof) euint32 amount   // explicit proof binder: `proof` is `Some`
+/// ```
+///
+/// The parser only records the marker. Whether the binder names a valid same-list proof
+/// parameter, and whether the implicit and explicit forms are mixed, is decided by the
+/// fhec checker, not here.
+///
+/// The whole marker is [`Self::span`]; the type that follows it starts at
+/// `VariableDefinition::ty.span.lo()`, so `var.span.with_hi(var.ty.span.lo())` is the text
+/// fhec strips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InSugar {
+    /// The span of the marker: the `in` keyword alone, or `in` through the closing `)` of
+    /// the binder.
+    pub span: Span,
+    /// The span of the `in` keyword alone. Equal to [`Self::span`] in the implicit form.
+    pub kw_span: Span,
+    /// The identifier bound by `in(...)`, if the explicit form was used.
+    pub proof: Option<Ident>,
+}
+
+impl InSugar {
+    /// Returns `true` if the explicit `in(proof)` form was used.
+    pub fn is_explicit(&self) -> bool {
+        self.proof.is_some()
+    }
+}
+
 /// A state variable or constant definition: `uint256 constant FOO = 42;`.
 ///
 /// Reference: <https://docs.soliditylang.org/en/latest/grammar.html#a4.SolidityParser.stateVariableDeclaration>
 #[derive(Debug)]
 pub struct VariableDefinition<'ast> {
     pub span: Span,
-    /// fhec fork patch (`.fsol` dialect extension, fhec spec §2.3): the span of the
-    /// `in` keyword when this variable was declared with the encrypted-input parameter
-    /// sugar, e.g. `in euint32 amount`. Always `None` for plain Solidity sources.
-    /// Whether the sugar is *legal* in this position is decided by the fhec checker, not
-    /// the parser.
-    pub in_sugar: Option<Span>,
+    /// fhec fork patch (`.fsol` dialect extension, fhec spec §2.3): set when this
+    /// variable was declared with the encrypted-input parameter sugar, e.g.
+    /// `in euint32 amount` or `in(inputProof) euint32 amount`. Always `None` for plain
+    /// Solidity sources. Whether the sugar is *legal* in this position is decided by the
+    /// fhec checker, not the parser.
+    pub in_sugar: Option<InSugar>,
     pub ty: Type<'ast>,
     pub visibility: Option<Visibility>,
     pub mutability: Option<VarMut>,

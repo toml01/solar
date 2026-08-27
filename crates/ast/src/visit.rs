@@ -158,7 +158,10 @@ declare_visitors! {
         fn visit_variable_definition(&mut self, var: &'ast #mut VariableDefinition<'ast>) -> ControlFlow<Self::BreakValue> {
             let VariableDefinition {
                 span,
-                in_sugar: _, // fhec fork patch: `.fsol` encrypted-input sugar marker
+                // fhec fork patch: `.fsol` encrypted-input sugar marker. Deliberately not
+                // visited: the `in(proof)` binder is resolved by fhec against the enclosing
+                // parameter list, not by this crate's name resolution.
+                in_sugar: _,
                 ty,
                 visibility: _,
                 mutability: _,
